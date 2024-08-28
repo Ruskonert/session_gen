@@ -1,0 +1,12 @@
+[package]
+name = "session_gen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fcaps = { version = "1.0.0", path = "../libs/fcaps" }
+libc = "*"
+chrono = "*"
+lazy_static = "*"
+rand = "0.8.5"
+clap = "4.1.10"
