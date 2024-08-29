@@ -1,7 +1,5 @@
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
-
 #[derive(Debug, Clone)]
 pub struct Poll<T> {
     data: Vec<T>,

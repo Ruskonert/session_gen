@@ -1,74 +1,26 @@
-use std::collections::HashSet;
 use std::io::Error;
-use std::os::fd::RawFd;
-use std::ptr;
 use std::sync::Mutex;
+use std::thread;
 use std::time::{Duration, Instant};
-use std::{mem, thread};
 
-use clap::{Arg, Command};
+use clap::{Arg, ArgAction, Command};
 use fpcaps::session::Session;
 use fpcaps::tracer::{L4Tracer, TracerDirection};
 
 use lazy_static::lazy_static;
 use libc::c_int;
-use libc::{c_uchar, close, ioctl, sendto, sockaddr_ll, socket, ETH_ALEN, SIOCGIFINDEX};
-use libc::{ifreq, AF_PACKET, ETH_P_ALL, SOCK_RAW};
+use libc::{close, sendto, sockaddr_ll};
 
-use rand::{thread_rng, Rng};
 use poll::Poll;
-use std::ffi::CString;
+use rand::rngs::StdRng;
+use rand::{thread_rng, Rng, SeedableRng};
+use util::{bind_to_interface, create_raw_socket, select_private_ip};
 
 pub mod poll;
+mod util;
 
 lazy_static! {
     pub static ref SENDED_PACKET: Mutex<u64> = Mutex::new(0);
-}
-
-fn create_ip(count: usize) -> Vec<String> {
-    let mut rng = rand::thread_rng();
-    let mut ips = HashSet::new();
-    while ips.len() < count {
-        let second_octet = rng.gen_range(0..=255);
-        let third_octet = rng.gen_range(0..=255);
-        let fourth_octet = rng.gen_range(1..=254);
-        let ip = format!("10.{}.{}.{}", second_octet, third_octet, fourth_octet);
-        ips.insert(ip);
-    }
-    ips.into_iter().map(|k| k).collect()
-}
-
-fn create_raw_socket() -> Result<RawFd, Error> {
-    unsafe {
-        let sockfd = socket(AF_PACKET, SOCK_RAW, ETH_P_ALL.to_be());
-        if sockfd < 0 {
-            return Err(Error::last_os_error());
-        }
-        Ok(sockfd)
-    }
-}
-
-fn bind_to_interface(
-    sockfd: c_int,
-    ifname: &str,
-    socket_addr: &mut sockaddr_ll,
-) -> Result<(), Error> {
-    unsafe {
-        let ifname_cstr = CString::new(ifname).unwrap();
-        let mut ifreq: ifreq = mem::zeroed();
-        ptr::copy_nonoverlapping(
-            ifname_cstr.as_ptr(),
-            ifreq.ifr_name.as_mut_ptr(),
-            ifname.len(),
-        );
-
-        if ioctl(sockfd, SIOCGIFINDEX, &ifreq as *const ifreq as *const _) < 0 {
-            return Err(Error::last_os_error());
-        }
-        socket_addr.sll_ifindex = ifreq.ifr_ifru.ifru_ifindex;
-        socket_addr.sll_halen = ETH_ALEN as c_uchar;
-    }
-    Ok(())
 }
 
 fn send_payload(sockfd: c_int, payload: &[u8], sock_addr: &sockaddr_ll) -> Result<(), Error> {
@@ -115,9 +67,7 @@ fn create_thread(
     let mut payload_polls = vec![];
     let mut end_count = 0;
     let session_count = sessions.len();
-    let busy_wait = unsafe {
-        BUSY_MODE
-    };
+    let busy_wait = unsafe { BUSY_MODE };
 
     for session in sessions {
         let mut tracer = L4Tracer::new_with_session(session);
@@ -152,7 +102,6 @@ fn create_thread(
                 if reverse == (tracer.direction() == TracerDirection::Forward) {
                     tracer.switch_direction(false);
                 }
-
                 for fin_payload in tracer.send(&payload, false) {
                     if let Err(error) = send_payload(sockfd, &fin_payload, &sock_addr) {
                         println!("{:?}", error);
@@ -196,6 +145,10 @@ static mut INTERFACE_NAME: Option<String> = None;
 static mut MAXIMUM_PPS: f64 = 0.75;
 static mut LOOP_COUNT: usize = 1;
 static mut BUSY_MODE: bool = false;
+static mut SEED: u64 = 0;
+
+static mut SRC_MAC: Option<String> = None;
+static mut DST_MAC: Option<String> = None;
 
 fn main() {
     let matches = Command::new("session_gen")
@@ -221,7 +174,7 @@ fn main() {
             Arg::new("iface")
                 .short('i')
                 .long("iface")
-                .default_value("eth4")
+                .default_value("eth1")
                 .help("Network interface name"),
         )
         .arg(
@@ -230,12 +183,33 @@ fn main() {
                 .long("pps")
                 .default_value("0.75")
                 .value_parser(clap::value_parser!(f64))
-                .help("Maximum packets per second"),
+                .help("The average PPS of packets sent per second by each session"),
         )
-        .arg(Arg::new("busy_mode")
-            .short('b')
-            .long("busy-mode")
-            .help("Enables busy mode")
+        .arg(
+            Arg::new("busy_mode")
+                .short('b')
+                .long("busy-mode")
+                .help("Enables busy mode")
+                .action(ArgAction::SetTrue)
+                .required(false),
+        )
+        .arg(
+            Arg::new("src")
+                .long("src")
+                .help("Set source mac")
+                .required(false),
+        )
+        .arg(
+            Arg::new("dst")
+                .long("dst")
+                .help("Set destination mac")
+                .required(false),
+        )
+        .arg(
+            Arg::new("seed")
+                .long("seed")
+                .value_parser(clap::value_parser!(u64))
+                .help("Seed for selecting specific randomized private IP"),
         )
         .arg(
             Arg::new("loop")
@@ -246,6 +220,8 @@ fn main() {
                 .help("Number of loops"),
         )
         .get_matches();
+
+    /* Dissects argument of program */
     unsafe {
         SESSION_COUNT = *matches.get_one("session_count").unwrap_or(&1000);
         THREAD_COUNT = *matches.get_one("thread").unwrap_or(&2);
@@ -259,6 +235,22 @@ fn main() {
         LOOP_COUNT = *matches.get_one("loop").unwrap_or(&1);
         BUSY_MODE = matches.contains_id("busy_mode");
         HOST_PER_COUNT = SESSION_COUNT / THREAD_COUNT;
+        SRC_MAC = Some(
+            matches
+                .get_one::<String>("src")
+                .map(|s| s.to_owned())
+                .unwrap_or("00:11:33:44:55:66".to_string()),
+        );
+
+        DST_MAC = Some(
+            matches
+                .get_one::<String>("dst")
+                .map(|s| s.to_owned())
+                .unwrap_or("a0:f5:09:7b:0a:8c".to_string()),
+        );
+
+        SEED = *matches.get_one("seed").unwrap_or(&0);
+
         if HOST_PER_COUNT == 0 {
             THREAD_COUNT = 1;
             HOST_PER_COUNT = SESSION_COUNT;
@@ -267,8 +259,9 @@ fn main() {
 
     let mut sockfd_s = Vec::new();
     let mut thread_s = Vec::new();
-    let mut rng = thread_rng();
     let mut remain = false;
+    let mut rng = rand::thread_rng();
+    let mut selected_rng = StdRng::seed_from_u64(unsafe { SEED });
     unsafe {
         let host_ips: usize = if SESSION_COUNT <= HOST_PER_COUNT {
             1
@@ -280,9 +273,15 @@ fn main() {
                 SESSION_COUNT / HOST_PER_COUNT
             }
         };
-
-        let session_all_ips =
-            create_ip((SESSION_COUNT + host_ips).try_into().unwrap());
+        let session_all_ips = if SEED == 0 {
+            select_private_ip((SESSION_COUNT + host_ips).try_into().unwrap(), 0, &mut rng)
+        } else {
+            select_private_ip(
+                (SESSION_COUNT + host_ips).try_into().unwrap(),
+                0,
+                &mut selected_rng,
+            )
+        };
         for host_idx in 0..host_ips {
             let start_idx = HOST_PER_COUNT * host_idx;
             let end_idx = if host_idx + 1 == host_ips {
@@ -299,13 +298,27 @@ fn main() {
                 "Generating session session_idx ({}..{})",
                 start_idx, end_idx
             );
+
             for session_idx in start_idx..end_idx {
-                let port = rng.gen_range(10000..=60000);
+                let port = if SEED == 0 {
+                    rng.gen_range(10000..=60000)
+                } else {
+                    selected_rng.gen_range(10000..=60000)
+                };
                 let mut session = Session::create_tcp(port, 80);
                 session.assign_src_ip(&session_all_ips[session_idx]);
 
                 let host_idx = SESSION_COUNT + (session_idx % host_ips);
                 session.assign_dst_ip(&session_all_ips[host_idx]);
+
+                if let Some(src) = &SRC_MAC.to_owned() {
+                    session.assign_src_mac(src);
+                }
+
+                if let Some(dst) = &DST_MAC.to_owned() {
+                    session.assign_dst_mac(dst);
+                }
+
                 sessions.push(session);
             }
 
@@ -317,7 +330,7 @@ fn main() {
                     let mut sockaddr_ll: sockaddr_ll = std::mem::zeroed();
 
                     if let Err(e) = bind_to_interface(sockfd, &iface, &mut sockaddr_ll) {
-                        println!("{:?}", e);
+                        println!("Failed to bind the interface ({}), detail: {:?}", iface, e);
                         break;
                     }
 
@@ -344,7 +357,7 @@ fn main() {
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 Err(e) => {
-                    println!("{:?}", e);
+                    println!("Failed to open the socket descriptor, detail: {:?}", e);
                     break;
                 }
             }
@@ -357,12 +370,16 @@ fn main() {
         match thread.join() {
             Ok(()) => {}
             Err(err) => {
-                println!("{:?}", err);
+                println!(
+                    "Failed to join the thread, thread id:{}, detail: {:?}",
+                    idx, err
+                );
             }
         }
         unsafe { close(sockfd_s[idx]) };
     }
+
     if let Ok(s) = SENDED_PACKET.lock() {
-        println!("Result .. Total packet sended: {}", *s);
+        println!("Result, Total packet sended: {}", *s);
     }
 }
