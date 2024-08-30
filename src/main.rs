@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Arg, ArgAction, Command};
 use fpcaps::session::Session;
-use fpcaps::tracer::{L4Tracer, TracerDirection};
+use fpcaps::tracer::{Tracer, TracerDirection};
 
 use lazy_static::lazy_static;
 use libc::c_int;
@@ -69,8 +69,12 @@ fn create_thread(
     let session_count = sessions.len();
     let busy_wait = unsafe { BUSY_MODE };
 
+    if busy_wait {
+        println!("!! Busy-mode is enabled, Be mindful of CPU resources");
+    }
+
     for session in sessions {
-        let mut tracer = L4Tracer::new_with_session(session);
+        let mut tracer = Tracer::new_with_session(session);
         tracer.set_mode_record_packet(false); // we don't need to record the generated packet.
 
         // Hello with 3-way-handshake
@@ -104,7 +108,7 @@ fn create_thread(
                 }
                 for fin_payload in tracer.send(&payload, false) {
                     if let Err(error) = send_payload(sockfd, &fin_payload, &sock_addr) {
-                        println!("{:?}", error);
+                        println!("Failed to send the packet, detail: {:?}", error);
                         break;
                     }
                 }
@@ -128,6 +132,7 @@ fn create_thread(
                 return;
             }
         }
+
         if !busy_wait {
             let elapsed_time = end_time.duration_since(Instant::now());
             let mics = elapsed_time.as_millis() as u64;
@@ -145,7 +150,7 @@ static mut INTERFACE_NAME: Option<String> = None;
 static mut MAXIMUM_PPS: f64 = 0.75;
 static mut LOOP_COUNT: usize = 1;
 static mut BUSY_MODE: bool = false;
-static mut SEED: u64 = 0;
+static mut SEED: usize = 0;
 
 static mut SRC_MAC: Option<String> = None;
 static mut DST_MAC: Option<String> = None;
@@ -197,22 +202,34 @@ fn main() {
             Arg::new("src")
                 .long("src")
                 .help("Set source mac")
+                .default_value("00:11:33:44:55:66")
                 .required(false),
         )
         .arg(
             Arg::new("dst")
                 .long("dst")
                 .help("Set destination mac")
+                .default_value("a0:f5:09:7b:0a:8c")
                 .required(false),
         )
         .arg(
             Arg::new("seed")
+                .short('e')
                 .long("seed")
-                .value_parser(clap::value_parser!(u64))
+                .default_value("0")
+                .value_parser(clap::value_parser!(usize))
                 .help("Seed for selecting specific randomized private IP"),
         )
         .arg(
             Arg::new("loop")
+                .short('l')
+                .long("loop")
+                .default_value("1")
+                .value_parser(clap::value_parser!(usize))
+                .help("Number of loops"),
+        )
+        .arg(
+            Arg::new("")
                 .short('l')
                 .long("loop")
                 .default_value("1")
@@ -233,7 +250,7 @@ fn main() {
         );
         MAXIMUM_PPS = *matches.get_one("pps").unwrap_or(&1.0);
         LOOP_COUNT = *matches.get_one("loop").unwrap_or(&1);
-        BUSY_MODE = matches.contains_id("busy_mode");
+        BUSY_MODE = *matches.get_one("busy_mode").unwrap_or(&false);
         HOST_PER_COUNT = SESSION_COUNT / THREAD_COUNT;
         SRC_MAC = Some(
             matches
@@ -261,7 +278,7 @@ fn main() {
     let mut thread_s = Vec::new();
     let mut remain = false;
     let mut rng = rand::thread_rng();
-    let mut selected_rng = StdRng::seed_from_u64(unsafe { SEED });
+    let mut selected_rng = StdRng::seed_from_u64(unsafe { SEED } as u64);
     unsafe {
         let host_ips: usize = if SESSION_COUNT <= HOST_PER_COUNT {
             1
@@ -300,11 +317,7 @@ fn main() {
             );
 
             for session_idx in start_idx..end_idx {
-                let port = if SEED == 0 {
-                    rng.gen_range(10000..=60000)
-                } else {
-                    selected_rng.gen_range(10000..=60000)
-                };
+                let port = rng.gen_range(10000..=60000);
                 let mut session = Session::create_tcp(port, 80);
                 session.assign_src_ip(&session_all_ips[session_idx]);
 
