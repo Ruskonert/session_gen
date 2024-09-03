@@ -15,6 +15,7 @@ pub struct Poll<T> {
     build_time: Instant,
     instant_time: Instant,
     ended: bool,
+    reset: bool,
 }
 
 impl<T> Default for Poll<T> {
@@ -31,6 +32,7 @@ impl<T> Default for Poll<T> {
             loop_intl: 0,
             build_time: now,
             ended: false,
+            reset: false,
         }
     }
 }
@@ -59,6 +61,10 @@ impl<T: Default> Poll<T> {
                 if self.idx == self.maximum {
                     self.idx = 0;
                     self.loop_intl += 1;
+                    self.reset = true;
+                }
+                else {
+                    self.reset = false;
                 }
 
                 if self.loop_count > 0 {
@@ -94,6 +100,10 @@ impl<T: Default> Poll<T> {
         self.ended
     }
 
+    pub fn is_reset(&self) -> bool {
+        self.reset
+    }
+
     pub fn build(&mut self) {
         let current_time = Instant::now();
 
@@ -105,6 +115,7 @@ impl<T: Default> Poll<T> {
         self.idx = 0;
         self.maximum = self.data.len();
         self.ended = false;
+        self.reset = false;
         self.loop_intl = 0;
     }
 

@@ -4,6 +4,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::{Arg, ArgAction, Command};
+use fpcaps::general::TcpFlag;
+use fpcaps::preset::{catch_syn_ack_fp_preset, catch_syn_fp_preset};
 use fpcaps::session::Session;
 use fpcaps::tracer::{Tracer, TracerDirection};
 
@@ -62,12 +64,17 @@ fn create_thread(
     loop_count: usize,
     sockfd: c_int,
     sock_addr: sockaddr_ll,
+    os_name: String,
+    has_reset: bool,
 ) {
     let mut tracers = vec![];
     let mut payload_polls = vec![];
     let mut end_count = 0;
     let session_count = sessions.len();
     let busy_wait = unsafe { BUSY_MODE };
+
+    let os_profile = catch_syn_fp_preset(&os_name);
+    let ack_os_profile = catch_syn_ack_fp_preset(&os_name);
 
     if busy_wait {
         println!("!! Busy-mode is enabled, Be mindful of CPU resources");
@@ -76,6 +83,16 @@ fn create_thread(
     for session in sessions {
         let mut tracer = Tracer::new_with_session(session);
         tracer.set_mode_record_packet(false); // we don't need to record the generated packet.
+
+        /* Register OS info if exists */
+        if let Some(os_profile) = &os_profile {
+            println!("syn FP: {:?}", os_profile);
+            tracer.regi_os(TcpFlag::Syn as u8, os_profile);
+        }
+        if let Some(os_profile) = &ack_os_profile {
+            println!("syn+ack FP: {:?}", os_profile);
+            tracer.regi_os(TcpFlag::Syn | TcpFlag::Ack, os_profile);
+        }
 
         // Hello with 3-way-handshake
         for payload in tracer.sendp_handshake() {
@@ -101,7 +118,6 @@ fn create_thread(
         let end_time = Instant::now();
         for (idx, payload_poll) in payload_polls.iter_mut().enumerate() {
             let tracer = &mut tracers[idx];
-
             if let Some((payload, reverse)) = payload_poll.poll() {
                 if reverse == (tracer.direction() == TracerDirection::Forward) {
                     tracer.switch_direction(false);
@@ -110,6 +126,16 @@ fn create_thread(
                     if let Err(error) = send_payload(sockfd, &fin_payload, &sock_addr) {
                         println!("Failed to send the packet, detail: {:?}", error);
                         break;
+                    }
+                }
+                
+                /* Try disconnect when all payloads are trasmitted */
+                if has_reset && payload_poll.is_reset() {
+                    for payload in tracer.sendp_handshake() {
+                        if let Err(error) = send_payload(sockfd, &payload, &sock_addr) {
+                            println!("{:?}", error);
+                            return;
+                        }
                     }
                 }
             }
@@ -127,7 +153,7 @@ fn create_thread(
                 }
                 end_count += 1;
             }
-
+        
             if end_count == session_count {
                 return;
             }
@@ -143,8 +169,8 @@ fn create_thread(
     }
 }
 
-static mut SESSION_COUNT: usize = 1000000;
-static mut HOST_PER_COUNT: usize = 50000;
+static mut SESSION_COUNT: usize = 1000;
+static mut HOST_PER_COUNT: usize = 2;
 static mut THREAD_COUNT: usize = 2;
 static mut INTERFACE_NAME: Option<String> = None;
 static mut MAXIMUM_PPS: f64 = 0.75;
@@ -163,7 +189,7 @@ fn main() {
             Arg::new("session_count")
                 .short('s')
                 .long("session-count")
-                .default_value("1000000")
+                .default_value("1000")
                 .value_parser(clap::value_parser!(usize))
                 .help("Number of sessions"),
         )
@@ -199,6 +225,13 @@ fn main() {
                 .required(false),
         )
         .arg(
+            Arg::new("has_reset")
+                .long("has-reset")
+                .help("Set reset")
+                .action(ArgAction::SetTrue)
+                .required(false),
+        )
+        .arg(
             Arg::new("src")
                 .long("src")
                 .help("Set source mac")
@@ -229,12 +262,11 @@ fn main() {
                 .help("Number of loops"),
         )
         .arg(
-            Arg::new("")
-                .short('l')
-                .long("loop")
-                .default_value("1")
-                .value_parser(clap::value_parser!(usize))
-                .help("Number of loops"),
+            Arg::new("os")
+                .short('o')
+                .long("os")
+                .default_value("")
+                .help("Apply them with profile"),
         )
         .get_matches();
 
@@ -279,6 +311,8 @@ fn main() {
     let mut remain = false;
     let mut rng = rand::thread_rng();
     let mut selected_rng = StdRng::seed_from_u64(unsafe { SEED } as u64);
+    let os_name = matches.get_one("os").unwrap_or(&"".to_string()).to_owned();
+    let has_reset = *matches.get_one("has_reset").unwrap_or(&false);
     unsafe {
         let host_ips: usize = if SESSION_COUNT <= HOST_PER_COUNT {
             1
@@ -356,7 +390,7 @@ fn main() {
                     let mut payloads = vec![];
                     payloads.push((request_payload, false));
                     payloads.push((response_payload, true));
-
+                    let os_name = os_name.clone();
                     thread_s.push(thread::spawn(move || {
                         create_thread(
                             sessions,
@@ -365,6 +399,8 @@ fn main() {
                             LOOP_COUNT,
                             sockfd,
                             sockaddr_ll,
+                            os_name,
+                            has_reset,
                         );
                     }));
                     std::thread::sleep(Duration::from_millis(100));
