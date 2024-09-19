@@ -10,8 +10,8 @@ use config::GenConfig;
 use fpcaps::general::{IPProtocol, TcpFlag};
 use fpcaps::preset::{catch_syn_ack_fp_preset, catch_syn_fp_preset};
 use fpcaps::session::Session;
-use fpcaps::tracer::{Tracer, TracerDirection};
 use fpcaps::tracer::http_tracer::{HTTPContentMethod, HTTPContentStatus, Tracer as HTTPTracer};
+use fpcaps::tracer::{Tracer, TracerDirection};
 
 use lazy_static::lazy_static;
 use libc::{c_int, sighandler_t, signal, SIGINT, SIGTERM};
@@ -74,7 +74,7 @@ fn benchmark_payload() {
 
 enum SessionGenTracer {
     Generic(Tracer),
-    Http(HTTPTracer)
+    Http(HTTPTracer),
 }
 
 fn create_thread(
@@ -126,8 +126,7 @@ fn create_thread(
 
             if !http_enabled {
                 SessionGenTracer::Generic(tracer)
-            }
-            else {
+            } else {
                 let http_tracer = HTTPTracer::new(tracer, "Gen/1.0");
                 SessionGenTracer::Http(http_tracer)
             }
@@ -161,18 +160,18 @@ fn create_thread(
                         if reverse == (tracer.direction() == TracerDirection::Forward) {
                             tracer.switch_direction(false);
                         }
-        
+
                         if tracer.protocol() == IPProtocol::TCP {
                             tracer.as_session().l4_tcp_flags = flags;
                         }
-        
+
                         for fin_payload in tracer.send(&payload, false) {
                             if let Err(error) = send_payload(sockfd, &fin_payload, &sock_addr) {
                                 println!("Failed to send the packet, detail: {:?}", error);
                                 break;
                             }
                         }
-        
+
                         /* Try disconnect when all payloads are trasmitted */
                         if has_reset && payload_poll.is_reset() {
                             for payload in tracer.sendp_handshake() {
@@ -184,7 +183,7 @@ fn create_thread(
                         }
                     }
                     SessionGenTracer::Http(h_tracer) => {
-                        const URL : &str = "/this_is_test_url?param=test&param2=test2&param3=test3";
+                        let url = unsafe { from_utf8_unchecked(&payload) };
                         let tracer = h_tracer.internal_mut();
                         if reverse == (tracer.direction() == TracerDirection::Forward) {
                             tracer.switch_direction(false);
@@ -193,31 +192,47 @@ fn create_thread(
                         let dir = tracer.direction();
                         let utf8_content = if dir == TracerDirection::Backward {
                             match from_utf8(&payload) {
-                            Ok(v) => {
-                                v.to_owned()
-                            },
-                            Err(_e) => {
-                                let k = vec![63 as u8; payload.len()]; // it describes "???? ..."
-                                unsafe {
-                                    from_utf8_unchecked(&k).to_owned()
+                                Ok(v) => v.to_owned(),
+                                Err(_e) => {
+                                    let k = vec![63 as u8; payload.len()]; // it describes "???? ..."
+                                    unsafe { from_utf8_unchecked(&k).to_owned() }
                                 }
                             }
-                        } } else {
+                        } else {
                             "".to_owned() // Request has not payload, ignoring
                         };
 
                         let final_payload = match dir {
                             TracerDirection::Forward => {
-                                h_tracer.sendp_request(HTTPContentMethod::Post, URL, true) // request is ignore!
+                                h_tracer.sendp_request(HTTPContentMethod::Post, url, true)
+                                // request is ignore!
                             }
                             TracerDirection::Backward => {
-                                h_tracer.sendp_response(HTTPContentStatus::Ok, URL, &utf8_content, true, false)
+                                let fin = has_reset;
+                                h_tracer.sendp_response(
+                                    HTTPContentStatus::Ok,
+                                    url,
+                                    &utf8_content,
+                                    fin,
+                                    false,
+                                )
                             }
                         };
+
                         for payload in final_payload {
                             if let Err(error) = send_payload(sockfd, &payload, &sock_addr) {
                                 println!("{:?}", error);
                                 return;
+                            }
+                        }
+
+                        if has_reset && payload_poll.is_reset() {
+                            let tracer = h_tracer.internal_mut();
+                            for payload in tracer.sendp_handshake() {
+                                if let Err(error) = send_payload(sockfd, &payload, &sock_addr) {
+                                    println!("{:?}", error);
+                                    return;
+                                }
                             }
                         }
                     }
@@ -226,22 +241,20 @@ fn create_thread(
 
             if payload_poll.is_ended() || SHUTDOWN.load(Ordering::SeqCst) {
                 let tracer = match sg_tracer {
-                    SessionGenTracer::Generic(tracer) => {
-                        tracer
-                    }
-                    SessionGenTracer::Http(h_tracer) => {
-                        h_tracer.internal_mut()
-                    }
+                    SessionGenTracer::Generic(tracer) => tracer,
+                    SessionGenTracer::Http(h_tracer) => h_tracer.internal_mut(),
                 };
 
                 if tracer.is_connected() {
                     /* @@@ Communication is ended */
-                    if let Err(error) = send_payload(sockfd, &tracer.sendp_tcp_finish(), &sock_addr) {
+                    if let Err(error) = send_payload(sockfd, &tracer.sendp_tcp_finish(), &sock_addr)
+                    {
                         println!("{:?}", error);
                         break;
                     }
                     tracer.switch_direction(false);
-                    if let Err(error) = send_payload(sockfd, &tracer.sendp_tcp_finish(), &sock_addr) {
+                    if let Err(error) = send_payload(sockfd, &tracer.sendp_tcp_finish(), &sock_addr)
+                    {
                         println!("{:?}", error);
                         break;
                     }
@@ -249,8 +262,8 @@ fn create_thread(
 
                 ended[idx] = true;
                 end_count += 1;
+            } else {
             }
-            else { }
         }
 
         if !busy_wait {
@@ -480,36 +493,42 @@ fn main() {
             None
         };
 
-        let session_all_ips = if let Some(cfg) = &cfg {
-            let mut v1 = generate_ips(
-                &format!(
-                    "{}.{}.{}.{}",
-                    cfg.l3_saddr[0], cfg.l3_saddr[1], cfg.l3_saddr[2], cfg.l3_saddr[3]
-                ),
-                (SESSION_COUNT).try_into().unwrap(),
-            );
+        let mut generate_ip = |count: usize| {
+            if SEED == 0 {
+                select_private_ip(count, 0, &mut rng)
+            } else {
+                select_private_ip(count, 0, &mut selected_rng)
+            }
+        };
 
+        let session_all_ips = if let Some(cfg) = &cfg {
             if &cfg.l3_daddr != &[0 as u8; 16] {
-                let v2 = generate_ips(
+                let mut v1 = generate_ips(
                     &format!(
                         "{}.{}.{}.{}",
-                        cfg.l3_daddr[0], cfg.l3_daddr[1], cfg.l3_daddr[2], cfg.l3_daddr[3]
+                        cfg.l3_saddr[0], cfg.l3_saddr[1], cfg.l3_saddr[2], cfg.l3_saddr[3]
                     ),
-                    (host_ips).try_into().unwrap(),
+                    (SESSION_COUNT).try_into().unwrap(),
                 );
-                v1.extend(v2);
-            }
-            v1
-        } else {
-            if SEED == 0 {
-                select_private_ip((SESSION_COUNT + host_ips).try_into().unwrap(), 0, &mut rng)
+
+                if &cfg.l3_daddr != &[0 as u8; 16] {
+                    let v2 = generate_ips(
+                        &format!(
+                            "{}.{}.{}.{}",
+                            cfg.l3_daddr[0], cfg.l3_daddr[1], cfg.l3_daddr[2], cfg.l3_daddr[3]
+                        ),
+                        (host_ips).try_into().unwrap(),
+                    );
+                    v1.extend(v2);
+                } else {
+                    v1.extend(generate_ip(host_ips));
+                }
+                v1
             } else {
-                select_private_ip(
-                    (SESSION_COUNT + host_ips).try_into().unwrap(),
-                    0,
-                    &mut selected_rng,
-                )
+                generate_ip(SESSION_COUNT + host_ips)
             }
+        } else {
+            generate_ip(SESSION_COUNT + host_ips)
         };
 
         let http_enabled = if let Some(cfg) = &cfg {
@@ -542,7 +561,9 @@ fn main() {
                 let mut session = if let Some(cfg) = &cfg {
                     match cfg.proto {
                         config::GenConfigProtocol::Raw => Session::create_ether(0x0800),
-                        config::GenConfigProtocol::Http | config::GenConfigProtocol::Tcp => Session::create_tcp(port, cfg.l4_dport),
+                        config::GenConfigProtocol::Http | config::GenConfigProtocol::Tcp => {
+                            Session::create_tcp(port, cfg.l4_dport)
+                        }
                         config::GenConfigProtocol::Udp => Session::create_udp(port, cfg.l4_dport),
                         _ => {
                             panic!("Unsupport Protocol type during load the preset");
@@ -593,7 +614,10 @@ fn main() {
                                 *flags
                             } else {
                                 match cfg.proto {
-                                    config::GenConfigProtocol::Tcp | config::GenConfigProtocol::Http => TcpFlag::Syn | TcpFlag::Push,
+                                    config::GenConfigProtocol::Tcp
+                                    | config::GenConfigProtocol::Http => {
+                                        TcpFlag::Syn | TcpFlag::Push
+                                    }
                                     _ => 0,
                                 }
                             };
@@ -620,7 +644,7 @@ fn main() {
                             sockaddr_ll,
                             os_name,
                             has_reset,
-                            http_enabled
+                            http_enabled,
                         );
                     }));
                 }

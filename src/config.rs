@@ -10,7 +10,7 @@ pub enum GenConfigProtocol {
     Icmp,
 
     // preset
-    Http, 
+    Http,
 
     Unknown,
 }
@@ -196,7 +196,14 @@ impl GenConfig {
                                 .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
                                 .collect()
                         };
-                        if let Some(hex_vec) = hex_to_vec(part[1]) {
+
+                        let py_result = if gc.proto == GenConfigProtocol::Http {
+                            Some(part[1].as_bytes().to_vec())
+                        } else {
+                            hex_to_vec(part[1])
+                        };
+
+                        if let Some(hex_vec) = py_result {
                             let mut result = GenConfigPayload {
                                 rev,
                                 payload: Some(hex_vec),
