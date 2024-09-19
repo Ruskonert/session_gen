@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::io::Error;
 use std::mem;
+use std::net::Ipv4Addr;
 use std::os::fd::RawFd;
 
 use libc::c_int;
@@ -9,6 +10,36 @@ use libc::{ifreq, AF_PACKET, ETH_P_ALL, SOCK_RAW};
 
 use rand::Rng;
 use std::ffi::CString;
+
+pub fn generate_ips(base_ip: &str, n: usize) -> Vec<String> {
+    let mut ip: Ipv4Addr = base_ip.parse().expect("Invalid IP address");
+    let mut ips = Vec::new();
+    let mut count = 0;
+
+    while count < n {
+        let octets = ip.octets();
+        if octets[3] != 0 && octets[3] != 255 {
+            ips.push(ip.to_string());
+            count += 1;
+        }
+        ip = increment_ip(ip);
+    }
+
+    ips
+}
+
+fn increment_ip(ip: Ipv4Addr) -> Ipv4Addr {
+    let mut octets = ip.octets();
+    for i in (0..4).rev() {
+        if octets[i] < 255 {
+            octets[i] += 1;
+            break;
+        } else {
+            octets[i] = 0;
+        }
+    }
+    Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3])
+}
 
 pub fn select_private_ip(count: usize, classify: u8, rng: &mut impl Rng) -> Vec<String> {
     let mut ips = HashSet::new();

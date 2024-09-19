@@ -8,5 +8,7 @@ fcaps = { version = "1.0.0", path = "../libs/fcaps" }
 libc = "*"
 chrono = "*"
 lazy_static = "*"
+toml = "*"
+serde = { version = "*", features = ["derive"] }
 rand = "0.8.5"
 clap = "3.0.0-beta2"

@@ -4,7 +4,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::{Arg, ArgAction, Command};
-use fpcaps::general::TcpFlag;
+use config::GenConfig;
+use fpcaps::general::{IPProtocol, TcpFlag};
 use fpcaps::preset::{catch_syn_ack_fp_preset, catch_syn_fp_preset};
 use fpcaps::session::Session;
 use fpcaps::tracer::{Tracer, TracerDirection};
@@ -16,8 +17,9 @@ use libc::{close, sendto, sockaddr_ll};
 use poll::Poll;
 use rand::rngs::StdRng;
 use rand::{thread_rng, Rng, SeedableRng};
-use util::{bind_to_interface, create_raw_socket, select_private_ip};
+use util::{bind_to_interface, create_raw_socket, generate_ips, select_private_ip};
 
+pub mod config;
 pub mod poll;
 mod util;
 
@@ -59,7 +61,7 @@ fn benchmark_payload() {
 
 fn create_thread(
     sessions: Vec<Session>,
-    payloads: Vec<(Vec<u8>, bool)>,
+    payloads: Vec<(Vec<u8>, bool, u8)>, // payload, reverse, flags
     maximum_pps: f64,
     loop_count: usize,
     sockfd: c_int,
@@ -118,17 +120,22 @@ fn create_thread(
         let end_time = Instant::now();
         for (idx, payload_poll) in payload_polls.iter_mut().enumerate() {
             let tracer = &mut tracers[idx];
-            if let Some((payload, reverse)) = payload_poll.poll() {
+            if let Some((payload, reverse, flags)) = payload_poll.poll() {
                 if reverse == (tracer.direction() == TracerDirection::Forward) {
                     tracer.switch_direction(false);
                 }
+
+                if tracer.protocol() == IPProtocol::TCP {
+                    tracer.as_session().l4_tcp_flags = flags;
+                }
+
                 for fin_payload in tracer.send(&payload, false) {
                     if let Err(error) = send_payload(sockfd, &fin_payload, &sock_addr) {
                         println!("Failed to send the packet, detail: {:?}", error);
                         break;
                     }
                 }
-                
+
                 /* Try disconnect when all payloads are trasmitted */
                 if has_reset && payload_poll.is_reset() {
                     for payload in tracer.sendp_handshake() {
@@ -153,7 +160,7 @@ fn create_thread(
                 }
                 end_count += 1;
             }
-        
+
             if end_count == session_count {
                 return;
             }
@@ -268,6 +275,12 @@ fn main() {
                 .default_value("")
                 .help("Apply them with profile"),
         )
+        .arg(
+            Arg::new("preset")
+                .long("preset")
+                .default_value("")
+                .help("Load preset TOML file"),
+        )
         .get_matches();
 
     /* Dissects argument of program */
@@ -311,8 +324,14 @@ fn main() {
     let mut remain = false;
     let mut rng = rand::thread_rng();
     let mut selected_rng = StdRng::seed_from_u64(unsafe { SEED } as u64);
+
     let os_name = matches.get_one("os").unwrap_or(&"".to_string()).to_owned();
     let has_reset = *matches.get_one("has_reset").unwrap_or(&false);
+    let preset_path = matches
+        .get_one("preset")
+        .unwrap_or(&"".to_string())
+        .to_owned();
+
     unsafe {
         let host_ips: usize = if SESSION_COUNT <= HOST_PER_COUNT {
             1
@@ -324,14 +343,76 @@ fn main() {
                 SESSION_COUNT / HOST_PER_COUNT
             }
         };
-        let session_all_ips = if SEED == 0 {
-            select_private_ip((SESSION_COUNT + host_ips).try_into().unwrap(), 0, &mut rng)
+
+        let cfg = if preset_path.len() > 0 {
+            match GenConfig::from_path(&preset_path) {
+                Ok(cfg) => {
+                    if &cfg.l2_smac != &[0 as u8; 6] {
+                        let mac = format!(
+                            "{:02x}:{:02x}:{:02x}:{:02}:{:02x}:{:02x}",
+                            cfg.l2_smac[0],
+                            cfg.l2_smac[1],
+                            cfg.l2_smac[2],
+                            cfg.l2_smac[3],
+                            cfg.l2_smac[4],
+                            cfg.l2_smac[5],
+                        );
+                        SRC_MAC = Some(mac);
+                        println!("Use preset Source MAC address: {:?}", SRC_MAC);
+                    }
+                    if &cfg.l2_dmac != &[0 as u8; 6] {
+                        let mac = format!(
+                            "{:02x}:{:02x}:{:02x}:{:02}:{:02x}:{:02x}",
+                            cfg.l2_dmac[0],
+                            cfg.l2_dmac[1],
+                            cfg.l2_dmac[2],
+                            cfg.l2_dmac[3],
+                            cfg.l2_dmac[4],
+                            cfg.l2_dmac[5],
+                        );
+                        DST_MAC = Some(mac);
+                        println!("Use preset Destination MAC address: {:?}", DST_MAC);
+                    }
+                    Some(cfg)
+                }
+                Err(e) => {
+                    panic!("{:?}", e);
+                }
+            }
         } else {
-            select_private_ip(
-                (SESSION_COUNT + host_ips).try_into().unwrap(),
-                0,
-                &mut selected_rng,
-            )
+            None
+        };
+
+        let session_all_ips = if let Some(cfg) = &cfg {
+            let mut v1 = generate_ips(
+                &format!(
+                    "{}.{}.{}.{}",
+                    cfg.l3_saddr[0], cfg.l3_saddr[1], cfg.l3_saddr[2], cfg.l3_saddr[3]
+                ),
+                (SESSION_COUNT).try_into().unwrap(),
+            );
+
+            if &cfg.l3_daddr != &[0 as u8; 16] {
+                let v2 = generate_ips(
+                    &format!(
+                        "{}.{}.{}.{}",
+                        cfg.l3_daddr[0], cfg.l3_daddr[1], cfg.l3_daddr[2], cfg.l3_daddr[3]
+                    ),
+                    (host_ips).try_into().unwrap(),
+                );
+                v1.extend(v2);
+            }
+            v1
+        } else {
+            if SEED == 0 {
+                select_private_ip((SESSION_COUNT + host_ips).try_into().unwrap(), 0, &mut rng)
+            } else {
+                select_private_ip(
+                    (SESSION_COUNT + host_ips).try_into().unwrap(),
+                    0,
+                    &mut selected_rng,
+                )
+            }
         };
         for host_idx in 0..host_ips {
             let start_idx = HOST_PER_COUNT * host_idx;
@@ -352,7 +433,19 @@ fn main() {
 
             for session_idx in start_idx..end_idx {
                 let port = rng.gen_range(10000..=60000);
-                let mut session = Session::create_tcp(port, 80);
+                let mut session = if let Some(cfg) = &cfg {
+                    match cfg.proto {
+                        config::GenConfigProtocol::Raw => Session::create_ether(0x0800),
+                        config::GenConfigProtocol::Tcp => Session::create_tcp(port, cfg.l4_dport),
+                        config::GenConfigProtocol::Udp => Session::create_udp(port, cfg.l4_dport),
+                        _ => {
+                            panic!("Unsupport Protocol type during load the preset");
+                        }
+                    }
+                } else {
+                    Session::create_tcp(port, 80)
+                };
+
                 session.assign_src_ip(&session_all_ips[session_idx]);
 
                 let host_idx = SESSION_COUNT + (session_idx % host_ips);
@@ -381,15 +474,35 @@ fn main() {
                         break;
                     }
 
-                    let request_payload =
+                    let mut payloads = vec![];
+                    if let Some(cfg) = &cfg {
+                        for payload in &cfg.payloads {
+                            let payload_raw = if let Some(p) = &payload.payload {
+                                p.clone()
+                            } else {
+                                vec![]
+                            };
+
+                            let flags = if let Some(flags) = &payload.flags {
+                                *flags
+                            } else {
+                                match cfg.proto {
+                                    config::GenConfigProtocol::Tcp => TcpFlag::Syn | TcpFlag::Push,
+                                    _ => 0,
+                                }
+                            };
+
+                            payloads.push((payload_raw, payload.rev, flags));
+                        }
+                    } else {
+                        let request_payload =
                         "POST /hello?param=<script>alert(\"Hello world!\");</script> HTTP/1.1\r\n"
                             .as_bytes()
                             .to_vec();
-                    let response_payload = "HTTP/1.1 200 OK\r\n".as_bytes().to_vec();
-
-                    let mut payloads = vec![];
-                    payloads.push((request_payload, false));
-                    payloads.push((response_payload, true));
+                        let response_payload = "HTTP/1.1 200 OK\r\n".as_bytes().to_vec();
+                        payloads.push((request_payload, false, TcpFlag::Syn | TcpFlag::Push));
+                        payloads.push((response_payload, true, TcpFlag::Syn | TcpFlag::Push));
+                    }
                     let os_name = os_name.clone();
                     thread_s.push(thread::spawn(move || {
                         create_thread(
@@ -403,7 +516,7 @@ fn main() {
                             has_reset,
                         );
                     }));
-                    std::thread::sleep(Duration::from_millis(100));
+                    std::thread::sleep(Duration::from_millis(500));
                 }
                 Err(e) => {
                     println!("Failed to open the socket descriptor, detail: {:?}", e);

@@ -62,9 +62,10 @@ impl<T: Default> Poll<T> {
                     self.idx = 0;
                     self.loop_intl += 1;
                     self.reset = true;
-                }
-                else {
-                    self.reset = false;
+                } else {
+                    if self.reset {
+                        self.reset = false;
+                    }
                 }
 
                 if self.loop_count > 0 {
