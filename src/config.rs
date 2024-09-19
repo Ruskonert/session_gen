@@ -8,6 +8,10 @@ pub enum GenConfigProtocol {
     Tcp,
     Udp,
     Icmp,
+
+    // preset
+    Http, 
+
     Unknown,
 }
 
@@ -146,6 +150,7 @@ impl GenConfig {
                 "TCP" => GenConfigProtocol::Tcp,
                 "UDP" => GenConfigProtocol::Udp,
                 "ICMP" => GenConfigProtocol::Icmp,
+                "HTTP" => GenConfigProtocol::Http,
                 "RAW" => GenConfigProtocol::Raw,
                 _ => {
                     eprintln!("What is case? {}", l3_proto);

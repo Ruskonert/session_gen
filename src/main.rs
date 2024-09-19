@@ -1,5 +1,7 @@
 use std::io::Error;
-use std::sync::Mutex;
+use std::str::{from_utf8, from_utf8_unchecked};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -9,9 +11,10 @@ use fpcaps::general::{IPProtocol, TcpFlag};
 use fpcaps::preset::{catch_syn_ack_fp_preset, catch_syn_fp_preset};
 use fpcaps::session::Session;
 use fpcaps::tracer::{Tracer, TracerDirection};
+use fpcaps::tracer::http_tracer::{HTTPContentMethod, HTTPContentStatus, Tracer as HTTPTracer};
 
 use lazy_static::lazy_static;
-use libc::c_int;
+use libc::{c_int, sighandler_t, signal, SIGINT, SIGTERM};
 use libc::{close, sendto, sockaddr_ll};
 
 use poll::Poll;
@@ -25,23 +28,33 @@ mod util;
 
 lazy_static! {
     pub static ref SENDED_PACKET: Mutex<u64> = Mutex::new(0);
+    pub static ref SHUTDOWN: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+}
+
+extern "C" fn handle_signal(_signal: i32) {
+    if !SHUTDOWN.load(Ordering::SeqCst) {
+        println!("Ctrl+C is detected, terminating thread ...");
+        SHUTDOWN.store(true, Ordering::SeqCst);
+    }
 }
 
 fn send_payload(sockfd: c_int, payload: &[u8], sock_addr: &sockaddr_ll) -> Result<(), Error> {
     unsafe {
-        let result = sendto(
-            sockfd,
-            payload as *const [u8] as *const _,
-            payload.len(),
-            0,
-            sock_addr as *const sockaddr_ll as *const _,
-            std::mem::size_of::<sockaddr_ll>() as u32,
-        );
-        if result < 0 {
-            return Err(Error::last_os_error());
-        }
-        if let Ok(mut i) = SENDED_PACKET.lock() {
-            *i += 1;
+        if payload.len() > 0 {
+            let result = sendto(
+                sockfd,
+                payload as *const [u8] as *const _,
+                payload.len(),
+                0,
+                sock_addr as *const sockaddr_ll as *const _,
+                std::mem::size_of::<sockaddr_ll>() as u32,
+            );
+            if result < 0 {
+                return Err(Error::last_os_error());
+            }
+            if let Ok(mut i) = SENDED_PACKET.lock() {
+                *i += 1;
+            }
         }
     }
     Ok(())
@@ -59,6 +72,11 @@ fn benchmark_payload() {
     }
 }
 
+enum SessionGenTracer {
+    Generic(Tracer),
+    Http(HTTPTracer)
+}
+
 fn create_thread(
     sessions: Vec<Session>,
     payloads: Vec<(Vec<u8>, bool, u8)>, // payload, reverse, flags
@@ -68,6 +86,7 @@ fn create_thread(
     sock_addr: sockaddr_ll,
     os_name: String,
     has_reset: bool,
+    http_enabled: bool,
 ) {
     let mut tracers = vec![];
     let mut payload_polls = vec![];
@@ -83,26 +102,37 @@ fn create_thread(
     }
 
     for session in sessions {
-        let mut tracer = Tracer::new_with_session(session);
-        tracer.set_mode_record_packet(false); // we don't need to record the generated packet.
+        let tracer = {
+            let mut tracer = Tracer::new_with_session(session);
+            tracer.set_mode_record_packet(false); // we don't need to record the generated packet.
 
-        /* Register OS info if exists */
-        if let Some(os_profile) = &os_profile {
-            println!("syn FP: {:?}", os_profile);
-            tracer.regi_os(TcpFlag::Syn as u8, os_profile);
-        }
-        if let Some(os_profile) = &ack_os_profile {
-            println!("syn+ack FP: {:?}", os_profile);
-            tracer.regi_os(TcpFlag::Syn | TcpFlag::Ack, os_profile);
-        }
-
-        // Hello with 3-way-handshake
-        for payload in tracer.sendp_handshake() {
-            if let Err(error) = send_payload(sockfd, &payload, &sock_addr) {
-                println!("{:?}", error);
-                return;
+            /* Register OS info if exists */
+            if let Some(os_profile) = &os_profile {
+                println!("syn FP: {:?}", os_profile);
+                tracer.regi_os(TcpFlag::Syn as u8, os_profile);
             }
-        }
+            if let Some(os_profile) = &ack_os_profile {
+                println!("syn+ack FP: {:?}", os_profile);
+                tracer.regi_os(TcpFlag::Syn | TcpFlag::Ack, os_profile);
+            }
+
+            // Hello with 3-way-handshake
+            for payload in tracer.sendp_handshake() {
+                if let Err(error) = send_payload(sockfd, &payload, &sock_addr) {
+                    println!("{:?}", error);
+                    return;
+                }
+            }
+
+            if !http_enabled {
+                SessionGenTracer::Generic(tracer)
+            }
+            else {
+                let http_tracer = HTTPTracer::new(tracer, "Gen/1.0");
+                SessionGenTracer::Http(http_tracer)
+            }
+        };
+
         tracers.push(tracer);
 
         let pps = thread_rng().gen_range(maximum_pps / 2.0..maximum_pps);
@@ -116,54 +146,111 @@ fn create_thread(
 
         payload_polls.push(payload_poll);
     }
+
+    let mut ended = vec![false; session_count];
     loop {
         let end_time = Instant::now();
         for (idx, payload_poll) in payload_polls.iter_mut().enumerate() {
-            let tracer = &mut tracers[idx];
+            if ended[idx] {
+                continue;
+            }
+            let sg_tracer = &mut tracers[idx];
             if let Some((payload, reverse, flags)) = payload_poll.poll() {
-                if reverse == (tracer.direction() == TracerDirection::Forward) {
-                    tracer.switch_direction(false);
-                }
-
-                if tracer.protocol() == IPProtocol::TCP {
-                    tracer.as_session().l4_tcp_flags = flags;
-                }
-
-                for fin_payload in tracer.send(&payload, false) {
-                    if let Err(error) = send_payload(sockfd, &fin_payload, &sock_addr) {
-                        println!("Failed to send the packet, detail: {:?}", error);
-                        break;
+                match sg_tracer {
+                    SessionGenTracer::Generic(tracer) => {
+                        if reverse == (tracer.direction() == TracerDirection::Forward) {
+                            tracer.switch_direction(false);
+                        }
+        
+                        if tracer.protocol() == IPProtocol::TCP {
+                            tracer.as_session().l4_tcp_flags = flags;
+                        }
+        
+                        for fin_payload in tracer.send(&payload, false) {
+                            if let Err(error) = send_payload(sockfd, &fin_payload, &sock_addr) {
+                                println!("Failed to send the packet, detail: {:?}", error);
+                                break;
+                            }
+                        }
+        
+                        /* Try disconnect when all payloads are trasmitted */
+                        if has_reset && payload_poll.is_reset() {
+                            for payload in tracer.sendp_handshake() {
+                                if let Err(error) = send_payload(sockfd, &payload, &sock_addr) {
+                                    println!("{:?}", error);
+                                    return;
+                                }
+                            }
+                        }
                     }
-                }
+                    SessionGenTracer::Http(h_tracer) => {
+                        const URL : &str = "/this_is_test_url?param=test&param2=test2&param3=test3";
+                        let tracer = h_tracer.internal_mut();
+                        if reverse == (tracer.direction() == TracerDirection::Forward) {
+                            tracer.switch_direction(false);
+                        }
 
-                /* Try disconnect when all payloads are trasmitted */
-                if has_reset && payload_poll.is_reset() {
-                    for payload in tracer.sendp_handshake() {
-                        if let Err(error) = send_payload(sockfd, &payload, &sock_addr) {
-                            println!("{:?}", error);
-                            return;
+                        let dir = tracer.direction();
+                        let utf8_content = if dir == TracerDirection::Backward {
+                            match from_utf8(&payload) {
+                            Ok(v) => {
+                                v.to_owned()
+                            },
+                            Err(_e) => {
+                                let k = vec![63 as u8; payload.len()]; // it describes "???? ..."
+                                unsafe {
+                                    from_utf8_unchecked(&k).to_owned()
+                                }
+                            }
+                        } } else {
+                            "".to_owned() // Request has not payload, ignoring
+                        };
+
+                        let final_payload = match dir {
+                            TracerDirection::Forward => {
+                                h_tracer.sendp_request(HTTPContentMethod::Post, URL, true) // request is ignore!
+                            }
+                            TracerDirection::Backward => {
+                                h_tracer.sendp_response(HTTPContentStatus::Ok, URL, &utf8_content, true, false)
+                            }
+                        };
+                        for payload in final_payload {
+                            if let Err(error) = send_payload(sockfd, &payload, &sock_addr) {
+                                println!("{:?}", error);
+                                return;
+                            }
                         }
                     }
                 }
             }
 
-            if payload_poll.is_ended() {
-                /* @@@ Communication is ended */
-                if let Err(error) = send_payload(sockfd, &tracer.sendp_tcp_finish(), &sock_addr) {
-                    println!("{:?}", error);
-                    break;
+            if payload_poll.is_ended() || SHUTDOWN.load(Ordering::SeqCst) {
+                let tracer = match sg_tracer {
+                    SessionGenTracer::Generic(tracer) => {
+                        tracer
+                    }
+                    SessionGenTracer::Http(h_tracer) => {
+                        h_tracer.internal_mut()
+                    }
+                };
+
+                if tracer.is_connected() {
+                    /* @@@ Communication is ended */
+                    if let Err(error) = send_payload(sockfd, &tracer.sendp_tcp_finish(), &sock_addr) {
+                        println!("{:?}", error);
+                        break;
+                    }
+                    tracer.switch_direction(false);
+                    if let Err(error) = send_payload(sockfd, &tracer.sendp_tcp_finish(), &sock_addr) {
+                        println!("{:?}", error);
+                        break;
+                    }
                 }
-                tracer.switch_direction(false);
-                if let Err(error) = send_payload(sockfd, &tracer.sendp_tcp_finish(), &sock_addr) {
-                    println!("{:?}", error);
-                    break;
-                }
+
+                ended[idx] = true;
                 end_count += 1;
             }
-
-            if end_count == session_count {
-                return;
-            }
+            else { }
         }
 
         if !busy_wait {
@@ -172,6 +259,11 @@ fn create_thread(
             if mics < 1000 {
                 std::thread::sleep(Duration::from_millis(1000 - mics));
             }
+        }
+
+        if end_count == session_count {
+            std::thread::sleep(Duration::from_secs(1));
+            return;
         }
     }
 }
@@ -189,6 +281,11 @@ static mut SRC_MAC: Option<String> = None;
 static mut DST_MAC: Option<String> = None;
 
 fn main() {
+    unsafe {
+        signal(SIGINT, handle_signal as sighandler_t);
+        signal(SIGTERM, handle_signal as sighandler_t);
+    }
+
     let matches = Command::new("session_gen")
         .version("1.0")
         .about("Session generator")
@@ -414,6 +511,15 @@ fn main() {
                 )
             }
         };
+
+        let http_enabled = if let Some(cfg) = &cfg {
+            cfg.proto == config::GenConfigProtocol::Http
+        } else {
+            false
+        };
+
+        println!("CFG Info: {:#?}", cfg);
+
         for host_idx in 0..host_ips {
             let start_idx = HOST_PER_COUNT * host_idx;
             let end_idx = if host_idx + 1 == host_ips {
@@ -436,7 +542,7 @@ fn main() {
                 let mut session = if let Some(cfg) = &cfg {
                     match cfg.proto {
                         config::GenConfigProtocol::Raw => Session::create_ether(0x0800),
-                        config::GenConfigProtocol::Tcp => Session::create_tcp(port, cfg.l4_dport),
+                        config::GenConfigProtocol::Http | config::GenConfigProtocol::Tcp => Session::create_tcp(port, cfg.l4_dport),
                         config::GenConfigProtocol::Udp => Session::create_udp(port, cfg.l4_dport),
                         _ => {
                             panic!("Unsupport Protocol type during load the preset");
@@ -487,7 +593,7 @@ fn main() {
                                 *flags
                             } else {
                                 match cfg.proto {
-                                    config::GenConfigProtocol::Tcp => TcpFlag::Syn | TcpFlag::Push,
+                                    config::GenConfigProtocol::Tcp | config::GenConfigProtocol::Http => TcpFlag::Syn | TcpFlag::Push,
                                     _ => 0,
                                 }
                             };
@@ -514,9 +620,9 @@ fn main() {
                             sockaddr_ll,
                             os_name,
                             has_reset,
+                            http_enabled
                         );
                     }));
-                    std::thread::sleep(Duration::from_millis(500));
                 }
                 Err(e) => {
                     println!("Failed to open the socket descriptor, detail: {:?}", e);
@@ -530,7 +636,9 @@ fn main() {
 
     for (idx, thread) in thread_s.into_iter().enumerate() {
         match thread.join() {
-            Ok(()) => {}
+            Ok(()) => {
+                println!("End thread idx {}", idx);
+            }
             Err(err) => {
                 println!(
                     "Failed to join the thread, thread id:{}, detail: {:?}",

@@ -61,7 +61,9 @@ impl<T: Default> Poll<T> {
                 if self.idx == self.maximum {
                     self.idx = 0;
                     self.loop_intl += 1;
-                    self.reset = true;
+                    if !self.reset {
+                        self.reset = true;
+                    }
                 } else {
                     if self.reset {
                         self.reset = false;
